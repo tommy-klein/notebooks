@@ -1,0 +1,148 @@
+---
+title: "R, a powerful tool to extract and aggregate gridded datasets"
+output: html_notebook
+---
+
+This [R Markdown](http://rmarkdown.rstudio.com) Notebook has two distinct goals:
+
+* show how climatic data stored as ncdf format can easily be extracted in R;
+* illustrate how gridded data can be aggregated at a given administrative level.
+
+# Datasets
+
+For this purpose, the gridded daily weather data for 1950-2015 available from the [E-OBS  repository](http://www.ecad.eu/download/ensembles/download.php) (v13.1 at 25 km x 25km horizontal resolution) is used (Haylock et al., 2008)[^refeobs].
+
+[^refeobs]: Haylock, M.R., N. Hofstra, A.M.G. Klein Tank, E.J. Klok, P.D. Jones, M. New. 2008: A European daily high-resolution gridded dataset of surface temperature and precipitation. J. Geophys. Res (Atmospheres), 113.
+
+The code chunk below reads the daily maximum temperature (**tx**) records from E-OBS and creates a RasterBrick i.e. a multi-layer raster object:
+```{r eobs_read, message=FALSE, warning=FALSE}
+require(raster)
+require(magrittr)
+
+eobs.path <- "~/Desktop/EOBS/%s_0.25deg_reg_v13.1.nc"
+tmax.nc <- sprintf(eobs.path, 'tx') %>%
+        brick()
+
+tmax.nc
+```
+
+Plotting the first 6 records (1950-01-01 - 1950-01-06):
+```{r eobs_plot, message=FALSE, warning=FALSE}
+plot(tmax.nc[[1:6]])
+```
+
+The analysis is performed for France at the departement level (admin 2). The shapefile (shp) comes from the [Global Administrative Areas | Boundaries without limits](http://www.gadm.org/).
+
+```{r shp, message=FALSE, warning=FALSE}
+ISO <- 'FRA'
+shp <- getData('GADM', country = ISO, level = 2)
+
+shp
+```
+
+# Grid creation
+
+The next step is the creation of the grid for E-OBS. Therefore, a mask with non NaNs is created and extracted for locations within the shp for France. Then, coordinates are extracted from the mask and saved as *SpatialPoints*.
+
+```{r mask, message=FALSE, warning=FALSE}
+require(dplyr)
+
+mask.EOBS <- !is.na(tmax.nc[[1]]) %>%
+        crop(shp) %>%
+        mask(shp)
+
+grid.EOBS <- coordinates(mask.EOBS) %>%
+    as.data.frame() %>%
+    mutate(keep = getValues(mask.EOBS)) %>%
+    filter(keep) %>%
+    SpatialPoints()
+projection(grid.EOBS) <- projection(shp)
+
+plot(grid.EOBS, col = 'red')
+plot(shp, add = T)
+```
+
+A lookup table is then created in which the admin levels 1 and 2 of each grid point is stored:
+```{r lookup, message=FALSE, warning=FALSE}
+lookup <- over(grid.EOBS, shp) %>%
+    tbl_df()
+lookup
+```
+
+# Time Series Extraction
+
+The extraction of grid time series from a RasterBrick is fairly straighforward in R, by subsetting the RasterBrick with a SpatialPoints object (in this case the grid definition). This operation can be quite time consuming. The resulting data structure is a matrix, which is then transposed, converted to a data.frame (long format).
+
+```{r ts, message=FALSE, warning=FALSE}
+require(tidyr)
+require(stringr)
+require(lubridate)
+
+tmax.ts <- tmax.nc[grid.EOBS] %>%
+        t %>%
+        as.data.frame() %>%
+        mutate(date = row.names(.) %>% str_sub(start = 2) %>% ymd) %>%
+        tbl_df %>%
+        gather(key = id, value = tmax, -date) %>%
+        mutate(id = id %>% str_sub(start = 2) %>% as.integer())
+
+tmax.ts
+```
+
+# Use Case
+
+This section contains a brief analysis of the number of critical days ($$T_\mathit{max} > 34^\circ C$$) per departement. First, the departement is added to each record (*lookup.adm2*).
+
+```{r ts2, message=FALSE, warning=FALSE}
+lookup.adm2 <- dplyr::select(lookup, NAME_2) %>%
+    rename(departement = NAME_2) %>% 
+    mutate(id = row.names(.) %>% as.integer())
+
+tmax.ts.lookup <- tmax.ts %>%
+    mutate(year = year(date),
+           month = month(date)) %>% 
+    left_join(lookup.adm2)
+```
+
+```{r crit, message=FALSE, warning=FALSE}
+threshold <- 34.  # degC
+
+crit.days <- tmax.ts.lookup %>%
+    group_by(year, id, departement) %>%
+    summarise(N = sum(tmax > threshold)) %>%
+    ungroup() %>%
+    group_by(year, departement) %>%
+    summarise(N.avg = mean(N))
+```
+
+The map below shows the average number of critical days per departement:
+```{r plot_map, message=FALSE, warning=FALSE}
+require(ggplot2)
+require(maptools)
+
+shp.ggplot <- shp %>%
+    fortify(region = 'NAME_2') %>%
+    rename(departement = id)
+
+dat.plot <- crit.days %>%
+    group_by(departement) %>%
+    summarise(N.avg = mean(N.avg)) %>%
+    right_join(shp.ggplot)
+
+ggplot(dat.plot) + 
+    aes(long, lat, group = group, fill = N.avg) + 
+    geom_polygon() +
+    geom_path(color = "white") +
+    scale_fill_gradient(low = 'grey', high = 'darkred') +
+    theme_void()
+```
+
+The histogram below shows the distribution of critical days:
+```{r plot_hist, message=FALSE, warning=FALSE}
+ggplot(crit.days,  aes(x = year, y = N.avg, fill = departement)) +
+    geom_bar(stat="identity") +
+    theme_bw() +
+    theme(legend.position="none") +
+    xlab('') +
+    ylab('# critical days')
+```
